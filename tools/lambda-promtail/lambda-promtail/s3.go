@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -23,10 +24,10 @@ var (
 	// source:  https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html#access-log-file-format
 	// format:  bucket[/prefix]/AWSLogs/aws-account-id/elasticloadbalancing/region/yyyy/mm/dd/aws-account-id_elasticloadbalancing_region_app.load-balancer-id_end-time_ip-address_random-string.log.gz
 	// example: my-bucket/AWSLogs/123456789012/elasticloadbalancing/us-east-1/2022/01/24/123456789012_elasticloadbalancing_us-east-1_app.my-loadbalancer.b13ea9d19f16d015_20220124T0000Z_0.0.0.0_2et2e1mx.log.gz
-	filenameRegex = regexp.MustCompile(`AWSLogs\/(?P<account_id>\d+)\/elasticloadbalancing\/(?P<region>[\w-]+)\/(?P<year>\d+)\/(?P<month>\d+)\/(?P<day>\d+)\/\d+\_elasticloadbalancing\_\w+-\w+-\d_(?:(?:app|nlb)\.*?)?(?P<lb>[a-zA-Z\-]+)`)
+	AWSFilenameRegex = regexp.MustCompile(`AWSLogs\/(?P<account_id>\d+)\/elasticloadbalancing\/(?P<region>[\w-]+)\/(?P<year>\d+)\/(?P<month>\d+)\/(?P<day>\d+)\/\d+\_elasticloadbalancing\_\w+-\w+-\d_(?:(?:app|nlb)\.*?)?(?P<lb>[a-zA-Z\-]+)`)
 
 	// regex that extracts the timestamp (RFC3339) from message log
-	timestampRegex = regexp.MustCompile(`\w+ (?P<timestamp>\d+-\d+-\d+T\d+:\d+:\d+\.\d+Z)`)
+	AWSTimestampRegex = regexp.MustCompile(`\w+ (?P<timestamp>\d+-\d+-\d+T\d+:\d+:\d+\.\d+Z)`)
 )
 
 func getS3Object(ctx context.Context, labels map[string]string) (io.ReadCloser, error) {
@@ -59,29 +60,48 @@ func getS3Object(ctx context.Context, labels map[string]string) (io.ReadCloser, 
 }
 
 func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.ReadCloser) error {
-	gzreader, err := gzip.NewReader(obj)
-	if err != nil {
-		return err
+	var scanner *bufio.Scanner
+
+	if labels["gz"] == "true" {
+		gzreader, err := gzip.NewReader(obj)
+		if err != nil {
+			return err
+		}
+
+		scanner = bufio.NewScanner(gzreader)
+	} else {
+		scanner = bufio.NewScanner(obj)
 	}
 
-	scanner := bufio.NewScanner(gzreader)
-
 	ls := model.LabelSet{
-		model.LabelName("__aws_log_type"):        model.LabelValue("s3_lb"),
-		model.LabelName("__aws_s3_log_lb"):       model.LabelValue(labels["lb"]),
-		model.LabelName("__aws_s3_log_lb_owner"): model.LabelValue(labels["account_id"]),
+		model.LabelName("__aws_log_type"): model.LabelValue(labels["type"]),
+	}
+
+	if labels["type"] == "s3_lb" {
+		tmpls := model.LabelSet{
+			model.LabelName("__aws_s3_log_lb"):       model.LabelValue(labels["lb"]),
+			model.LabelName("__aws_s3_log_lb_owner"): model.LabelValue(labels["account_id"]),
+		}
+
+		ls = ls.Merge(tmpls)
 	}
 
 	ls = applyExtraLabels(ls)
 
+	var timestamp time.Time
+	var err error
 	for scanner.Scan() {
 		i := 0
 		log_line := scanner.Text()
-		match := timestampRegex.FindStringSubmatch(log_line)
+		match := AWSTimestampRegex.FindStringSubmatch(log_line)
 
-		timestamp, err := time.Parse(time.RFC3339, match[1])
-		if err != nil {
-			return err
+		if match != nil {
+			timestamp, err = time.Parse(time.RFC3339, match[1])
+			if err != nil {
+				return err
+			}
+		} else {
+			timestamp = time.Now()
 		}
 
 		b.add(ctx, entry{ls, logproto.Entry{
@@ -103,11 +123,25 @@ func getLabels(record events.S3EventRecord) (map[string]string, error) {
 	labels["bucket_owner"] = record.S3.Bucket.OwnerIdentity.PrincipalID
 	labels["bucket_region"] = record.AWSRegion
 
-	match := filenameRegex.FindStringSubmatch(labels["key"])
-	for i, name := range filenameRegex.SubexpNames() {
-		if i != 0 && name != "" {
-			labels[name] = match[i]
+	match := AWSFilenameRegex.FindStringSubmatch(labels["key"])
+
+	if match != nil {
+		// object is an AWS Load Balancer log
+		labels["type"] = "s3_lb"
+
+		for i, name := range AWSFilenameRegex.SubexpNames() {
+			if i != 0 && name != "" {
+				labels[name] = match[i]
+			}
 		}
+	} else {
+		labels["type"] = "s3_generic"
+	}
+
+	if strings.HasSuffix(labels["key"], "gz") == true {
+		labels["gz"] = "true"
+	} else {
+		labels["gz"] = "false"
 	}
 
 	return labels, nil
