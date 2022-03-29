@@ -26,8 +26,7 @@ var (
 	// example: my-bucket/AWSLogs/123456789012/elasticloadbalancing/us-east-1/2022/01/24/123456789012_elasticloadbalancing_us-east-1_app.my-loadbalancer.b13ea9d19f16d015_20220124T0000Z_0.0.0.0_2et2e1mx.log.gz
 	AWSFilenameRegex = regexp.MustCompile(`AWSLogs\/(?P<account_id>\d+)\/elasticloadbalancing\/(?P<region>[\w-]+)\/(?P<year>\d+)\/(?P<month>\d+)\/(?P<day>\d+)\/\d+\_elasticloadbalancing\_\w+-\w+-\d_(?:(?:app|nlb)\.*?)?(?P<lb>[a-zA-Z\-]+)`)
 
-	// regex that extracts the timestamp (RFC3339) from message log
-	AWSTimestampRegex = regexp.MustCompile(`\w+ (?P<timestamp>\d+-\d+-\d+T\d+:\d+:\d+\.\d+Z)`)
+	RFC3339Regex = regexp.MustCompile(`(?P<timestamp>(?:(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2}(?:\.\d+)?))(Z|[\+-]\d{2}:\d{2})?)`)
 )
 
 func getS3Object(ctx context.Context, labels map[string]string) (io.ReadCloser, error) {
@@ -93,7 +92,7 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 	for scanner.Scan() {
 		i := 0
 		log_line := scanner.Text()
-		match := AWSTimestampRegex.FindStringSubmatch(log_line)
+		match := RFC3339Regex.FindStringSubmatch(log_line)
 
 		if match != nil {
 			timestamp, err = time.Parse(time.RFC3339, match[1])
